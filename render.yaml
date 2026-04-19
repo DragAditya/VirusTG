@@ -1,0 +1,18 @@
+services:
+  - type: worker               # Background worker — never sleeps on free tier!
+    name: vt-telegram-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false            # Set manually in Render dashboard
+      - key: VT_API_KEY
+        sync: false            # Set manually in Render dashboard
+      - key: PORT
+        value: "8080"
+      - key: MAX_FILE_SIZE_MB
+        value: "32"
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+
