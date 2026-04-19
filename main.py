@@ -1,8 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════╗
-║         🛡️  VirusTotal Telegram Bot v1.0             ║
-║     Built with python-telegram-bot 22.7 + VT API v3  ║
-║         Async • Production-Ready • Render-Ready       ║
+║         🛡️  VirusTotal Telegram Bot v2.0             ║
+║     python-telegram-bot 22.7 + VT API v3             ║
+║     Webhook Mode + Self-Ping (Render Free Web)       ║
 ╚══════════════════════════════════════════════════════╝
 """
 
@@ -12,16 +12,13 @@ import io
 import logging
 import os
 import re
-import time
 from base64 import urlsafe_b64encode
-from typing import Optional
 
 import aiohttp
 from aiohttp import web
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Message,
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
@@ -36,7 +33,7 @@ from telegram.ext import (
 )
 
 # ─────────────────────────────────────────────
-#  Logging Setup
+#  Logging
 # ─────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
@@ -46,57 +43,53 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ─────────────────────────────────────────────
-#  Environment Variables
+#  Config from Environment
 # ─────────────────────────────────────────────
-BOT_TOKEN: str = os.environ["BOT_TOKEN"]
-VT_API_KEY: str = os.environ["VT_API_KEY"]
-PORT: int = int(os.getenv("PORT", "8080"))
+BOT_TOKEN: str       = os.environ["BOT_TOKEN"]
+VT_API_KEY: str      = os.environ["VT_API_KEY"]
+RENDER_URL: str      = os.environ.get("RENDER_URL", "")   # e.g. https://my-bot.onrender.com
+PORT: int            = int(os.getenv("PORT", "8080"))
 MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "32"))
 
+WEBHOOK_PATH  = f"/webhook/{BOT_TOKEN}"
+WEBHOOK_URL   = f"{RENDER_URL}{WEBHOOK_PATH}"
+
 # ─────────────────────────────────────────────
-#  VirusTotal API v3 Base
+#  VirusTotal
 # ─────────────────────────────────────────────
-VT_BASE = "https://www.virustotal.com/api/v3"
+VT_BASE    = "https://www.virustotal.com/api/v3"
 VT_HEADERS = {"x-apikey": VT_API_KEY, "Accept": "application/json"}
-VT_GUI_BASE = "https://www.virustotal.com/gui"
+VT_GUI     = "https://www.virustotal.com/gui"
 
-# Rate limit: free tier = 4 requests/minute, 500/day
-POLL_INTERVAL = 5      # seconds between analysis polls
-POLL_MAX_TRIES = 24    # max 2 minutes wait
-
+POLL_INTERVAL = 5
+POLL_MAX_TRIES = 24
 
 # ─────────────────────────────────────────────
-#  Utility: Regex Patterns
+#  Regex Patterns
 # ─────────────────────────────────────────────
 HASH_MD5    = re.compile(r"^[a-fA-F0-9]{32}$")
 HASH_SHA1   = re.compile(r"^[a-fA-F0-9]{40}$")
 HASH_SHA256 = re.compile(r"^[a-fA-F0-9]{64}$")
-URL_PATTERN = re.compile(
-    r"(https?://[^\s]+|[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}(/[^\s]*)?)"
-)
-IP_PATTERN  = re.compile(
-    r"^(\d{1,3}\.){3}\d{1,3}$"
-)
-DOMAIN_PATTERN = re.compile(
+IP_PATTERN  = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+DOMAIN_RE   = re.compile(
     r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$"
 )
 
 
 # ─────────────────────────────────────────────
-#  Emoji Threat Indicators
+#  Helpers
 # ─────────────────────────────────────────────
 def threat_emoji(malicious: int, total: int) -> str:
     if total == 0:
         return "⚪"
-    ratio = malicious / total
     if malicious == 0:
         return "✅"
-    elif ratio < 0.05 or malicious <= 2:
+    r = malicious / total
+    if r < 0.05 or malicious <= 2:
         return "🟡"
-    elif ratio < 0.20 or malicious <= 5:
+    elif r < 0.20 or malicious <= 5:
         return "🟠"
-    else:
-        return "🔴"
+    return "🔴"
 
 
 def verdict_text(malicious: int, suspicious: int) -> str:
@@ -108,24 +101,20 @@ def verdict_text(malicious: int, suspicious: int) -> str:
         return "🟠 *LOW THREAT*"
     elif malicious <= 10:
         return "🔴 *THREAT DETECTED*"
-    else:
-        return "🚨 *HIGH THREAT — MALWARE*"
+    return "🚨 *HIGH THREAT — MALWARE*"
 
 
-def format_stats_bar(stats: dict) -> str:
-    malicious   = stats.get("malicious", 0)
-    suspicious  = stats.get("suspicious", 0)
-    harmless    = stats.get("harmless", 0)
-    undetected  = stats.get("undetected", 0)
-    timeout     = stats.get("timeout", 0)
-    total = malicious + suspicious + harmless + undetected + timeout or 1
-    bar_len = 20
-    filled = round((malicious + suspicious) / total * bar_len)
-    bar = "█" * filled + "░" * (bar_len - filled)
-    return f"`[{bar}]`"
+def stats_bar(stats: dict) -> str:
+    m = stats.get("malicious", 0)
+    s = stats.get("suspicious", 0)
+    h = stats.get("harmless", 0)
+    u = stats.get("undetected", 0)
+    total = m + s + h + u or 1
+    filled = round((m + s) / total * 20)
+    return f"`[{'█' * filled}{'░' * (20 - filled)}]`"
 
 
-def bytes_to_human(n: int) -> str:
+def human_bytes(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024:
             return f"{n:.1f} {unit}"
@@ -133,872 +122,556 @@ def bytes_to_human(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+def top_detections(results: dict, limit: int = 6) -> str:
+    lines = [
+        f"  • `{eng}`: {info.get('result', 'malicious')}"
+        for eng, info in results.items()
+        if info.get("category") in ("malicious", "suspicious")
+    ][:limit]
+    return "\n\n🔬 *Top Detections:*\n" + "\n".join(lines) if lines else ""
+
+
 # ─────────────────────────────────────────────
-#  VirusTotal API Calls (async)
+#  VT API Calls
 # ─────────────────────────────────────────────
-async def vt_get(session: aiohttp.ClientSession, endpoint: str) -> dict:
+async def vt_get(session: aiohttp.ClientSession, endpoint: str):
     async with session.get(f"{VT_BASE}{endpoint}", headers=VT_HEADERS) as r:
         return await r.json(), r.status
 
 
-async def vt_post_json(session: aiohttp.ClientSession, endpoint: str, data: dict) -> dict:
-    async with session.post(
-        f"{VT_BASE}{endpoint}", headers=VT_HEADERS, data=data
-    ) as r:
+async def vt_post(session: aiohttp.ClientSession, endpoint: str, data: dict):
+    async with session.post(f"{VT_BASE}{endpoint}", headers=VT_HEADERS, data=data) as r:
         return await r.json(), r.status
 
 
-async def vt_post_file(
-    session: aiohttp.ClientSession, file_bytes: bytes, filename: str
-) -> dict:
+async def vt_upload_file(session: aiohttp.ClientSession, file_bytes: bytes, filename: str):
     form = aiohttp.FormData()
     form.add_field("file", file_bytes, filename=filename, content_type="application/octet-stream")
-    async with session.post(
-        f"{VT_BASE}/files", headers=VT_HEADERS, data=form
-    ) as r:
+    async with session.post(f"{VT_BASE}/files", headers=VT_HEADERS, data=form) as r:
         return await r.json(), r.status
 
 
-async def vt_poll_analysis(
-    session: aiohttp.ClientSession, analysis_id: str
-) -> Optional[dict]:
-    """Poll /analyses/{id} until completed or timeout."""
+async def vt_poll(session: aiohttp.ClientSession, analysis_id: str):
     for _ in range(POLL_MAX_TRIES):
         data, status = await vt_get(session, f"/analyses/{analysis_id}")
         if status == 200:
-            attrs = data.get("data", {}).get("attributes", {})
-            if attrs.get("status") == "completed":
+            if data.get("data", {}).get("attributes", {}).get("status") == "completed":
                 return data
         await asyncio.sleep(POLL_INTERVAL)
     return None
 
 
 # ─────────────────────────────────────────────
-#  Result Formatters
+#  Report Formatters
 # ─────────────────────────────────────────────
-def format_file_report(attrs: dict, filename: str = "Unknown") -> str:
-    stats       = attrs.get("last_analysis_stats", {})
-    malicious   = stats.get("malicious", 0)
-    suspicious  = stats.get("suspicious", 0)
-    harmless    = stats.get("harmless", 0)
-    undetected  = stats.get("undetected", 0)
-    total       = malicious + suspicious + harmless + undetected
-
-    md5    = attrs.get("md5", "N/A")
-    sha1   = attrs.get("sha1", "N/A")
-    sha256 = attrs.get("sha256", "N/A")
-    size   = attrs.get("size", 0)
-    ftype  = attrs.get("type_description", attrs.get("magic", "Unknown"))
-    names  = attrs.get("meaningful_name", filename)
-
-    # Top detected threats
-    results      = attrs.get("last_analysis_results", {})
-    detections   = [
-        f"  • `{engine}`: {info.get('result', 'malicious')}"
-        for engine, info in results.items()
-        if info.get("category") in ("malicious", "suspicious")
-    ][:8]  # cap at 8
-
-    detection_block = ""
-    if detections:
-        detection_block = "\n\n🔬 *Top Detections:*\n" + "\n".join(detections)
-
-    verdict = verdict_text(malicious, suspicious)
-    bar     = format_stats_bar(stats)
-    emoji   = threat_emoji(malicious, total)
-
+def fmt_file(attrs: dict, filename: str = "Unknown") -> str:
+    s = attrs.get("last_analysis_stats", {})
+    m, sus, h, u = s.get("malicious", 0), s.get("suspicious", 0), s.get("harmless", 0), s.get("undetected", 0)
+    total = m + sus + h + u
     return (
-        f"{emoji} *VirusTotal File Report*\n"
-        f"{'─' * 30}\n"
-        f"📄 *File:* `{names[:50]}`\n"
-        f"📦 *Size:* `{bytes_to_human(size)}`\n"
-        f"🗂 *Type:* `{ftype}`\n\n"
-        f"🏁 *Verdict:* {verdict}\n"
-        f"📊 *Detection:* `{malicious}/{total}` engines\n"
-        f"{bar}\n\n"
-        f"🟥 Malicious:  `{malicious}`\n"
-        f"🟧 Suspicious: `{suspicious}`\n"
-        f"🟩 Harmless:   `{harmless}`\n"
-        f"⬜ Undetected: `{undetected}`\n\n"
+        f"{threat_emoji(m, total)} *VirusTotal File Report*\n"
+        f"{'─'*30}\n"
+        f"📄 *File:* `{str(attrs.get('meaningful_name', filename))[:50]}`\n"
+        f"📦 *Size:* `{human_bytes(attrs.get('size', 0))}`\n"
+        f"🗂 *Type:* `{attrs.get('type_description', attrs.get('magic','Unknown'))}`\n\n"
+        f"🏁 *Verdict:* {verdict_text(m, sus)}\n"
+        f"📊 *Detection:* `{m}/{total}` engines\n"
+        f"{stats_bar(s)}\n\n"
+        f"🟥 Malicious:  `{m}`\n"
+        f"🟧 Suspicious: `{sus}`\n"
+        f"🟩 Harmless:   `{h}`\n"
+        f"⬜ Undetected: `{u}`\n\n"
         f"🔐 *Hashes:*\n"
-        f"  MD5:    `{md5}`\n"
-        f"  SHA1:   `{sha1}`\n"
-        f"  SHA256: `{sha256[:32]}...`"
-        f"{detection_block}"
+        f"  MD5:    `{attrs.get('md5','N/A')}`\n"
+        f"  SHA1:   `{attrs.get('sha1','N/A')}`\n"
+        f"  SHA256: `{attrs.get('sha256','N/A')[:32]}...`"
+        f"{top_detections(attrs.get('last_analysis_results',{}))}"
     )
 
 
-def format_url_report(attrs: dict, url: str) -> str:
-    stats       = attrs.get("last_analysis_stats", {})
-    malicious   = stats.get("malicious", 0)
-    suspicious  = stats.get("suspicious", 0)
-    harmless    = stats.get("harmless", 0)
-    undetected  = stats.get("undetected", 0)
-    total       = malicious + suspicious + harmless + undetected
-
-    categories  = attrs.get("categories", {})
-    cat_str     = ", ".join(set(categories.values()))[:80] if categories else "N/A"
-    final_url   = attrs.get("last_final_url", url)[:80]
-    title       = attrs.get("title", "N/A")[:60]
-
-    results     = attrs.get("last_analysis_results", {})
-    detections  = [
-        f"  • `{engine}`: {info.get('result', 'malicious')}"
-        for engine, info in results.items()
-        if info.get("category") in ("malicious", "suspicious")
-    ][:6]
-
-    detection_block = ""
-    if detections:
-        detection_block = "\n\n🔬 *Flagged By:*\n" + "\n".join(detections)
-
-    verdict = verdict_text(malicious, suspicious)
-    bar     = format_stats_bar(stats)
-    emoji   = threat_emoji(malicious, total)
-
+def fmt_url(attrs: dict, url: str) -> str:
+    s = attrs.get("last_analysis_stats", {})
+    m, sus, h, u = s.get("malicious", 0), s.get("suspicious", 0), s.get("harmless", 0), s.get("undetected", 0)
+    total = m + sus + h + u
+    cats = ", ".join(set(attrs.get("categories", {}).values()))[:80] or "N/A"
     return (
-        f"{emoji} *VirusTotal URL Report*\n"
-        f"{'─' * 30}\n"
+        f"{threat_emoji(m, total)} *VirusTotal URL Report*\n"
+        f"{'─'*30}\n"
         f"🔗 *URL:* `{url[:60]}{'...' if len(url)>60 else ''}`\n"
-        f"📌 *Title:* `{title}`\n"
-        f"🏷 *Category:* `{cat_str}`\n\n"
-        f"🏁 *Verdict:* {verdict}\n"
-        f"📊 *Detection:* `{malicious}/{total}` engines\n"
-        f"{bar}\n\n"
-        f"🟥 Malicious:  `{malicious}`\n"
-        f"🟧 Suspicious: `{suspicious}`\n"
-        f"🟩 Harmless:   `{harmless}`\n"
-        f"⬜ Undetected: `{undetected}`"
-        f"{detection_block}"
+        f"📌 *Title:* `{str(attrs.get('title','N/A'))[:60]}`\n"
+        f"🏷 *Category:* `{cats}`\n\n"
+        f"🏁 *Verdict:* {verdict_text(m, sus)}\n"
+        f"📊 *Detection:* `{m}/{total}` engines\n"
+        f"{stats_bar(s)}\n\n"
+        f"🟥 Malicious:  `{m}`\n"
+        f"🟧 Suspicious: `{sus}`\n"
+        f"🟩 Harmless:   `{h}`\n"
+        f"⬜ Undetected: `{u}`"
+        f"{top_detections(attrs.get('last_analysis_results',{}))}"
     )
 
 
-def format_domain_report(attrs: dict, domain: str) -> str:
-    stats       = attrs.get("last_analysis_stats", {})
-    malicious   = stats.get("malicious", 0)
-    suspicious  = stats.get("suspicious", 0)
-    harmless    = stats.get("harmless", 0)
-    undetected  = stats.get("undetected", 0)
-    total       = malicious + suspicious + harmless + undetected
-
-    registrar   = attrs.get("registrar", "N/A")
-    creation    = attrs.get("creation_date", "N/A")
-    categories  = attrs.get("categories", {})
-    cat_str     = ", ".join(set(categories.values()))[:80] if categories else "N/A"
-    country     = attrs.get("country", "N/A")
-    rep_score   = attrs.get("reputation", "N/A")
-
-    results     = attrs.get("last_analysis_results", {})
-    detections  = [
-        f"  • `{engine}`: {info.get('result','malicious')}"
-        for engine, info in results.items()
-        if info.get("category") in ("malicious", "suspicious")
-    ][:6]
-
-    detection_block = ""
-    if detections:
-        detection_block = "\n\n🔬 *Flagged By:*\n" + "\n".join(detections)
-
-    verdict = verdict_text(malicious, suspicious)
-    bar     = format_stats_bar(stats)
-    emoji   = threat_emoji(malicious, total)
-
+def fmt_domain(attrs: dict, domain: str) -> str:
+    s = attrs.get("last_analysis_stats", {})
+    m, sus, h, u = s.get("malicious", 0), s.get("suspicious", 0), s.get("harmless", 0), s.get("undetected", 0)
+    total = m + sus + h + u
+    cats = ", ".join(set(attrs.get("categories", {}).values()))[:80] or "N/A"
     return (
-        f"{emoji} *VirusTotal Domain Report*\n"
-        f"{'─' * 30}\n"
+        f"{threat_emoji(m, total)} *VirusTotal Domain Report*\n"
+        f"{'─'*30}\n"
         f"🌐 *Domain:* `{domain}`\n"
-        f"🏢 *Registrar:* `{str(registrar)[:40]}`\n"
-        f"🗓 *Created:* `{creation}`\n"
-        f"🌍 *Country:* `{country}`\n"
-        f"⭐ *Reputation:* `{rep_score}`\n"
-        f"🏷 *Category:* `{cat_str}`\n\n"
-        f"🏁 *Verdict:* {verdict}\n"
-        f"📊 *Detection:* `{malicious}/{total}` engines\n"
-        f"{bar}\n\n"
-        f"🟥 Malicious:  `{malicious}`\n"
-        f"🟧 Suspicious: `{suspicious}`\n"
-        f"🟩 Harmless:   `{harmless}`\n"
-        f"⬜ Undetected: `{undetected}`"
-        f"{detection_block}"
+        f"🏢 *Registrar:* `{str(attrs.get('registrar','N/A'))[:40]}`\n"
+        f"🗓 *Created:* `{attrs.get('creation_date','N/A')}`\n"
+        f"🌍 *Country:* `{attrs.get('country','N/A')}`\n"
+        f"⭐ *Reputation:* `{attrs.get('reputation','N/A')}`\n"
+        f"🏷 *Category:* `{cats}`\n\n"
+        f"🏁 *Verdict:* {verdict_text(m, sus)}\n"
+        f"📊 *Detection:* `{m}/{total}` engines\n"
+        f"{stats_bar(s)}\n\n"
+        f"🟥 Malicious:  `{m}`\n"
+        f"🟧 Suspicious: `{sus}`\n"
+        f"🟩 Harmless:   `{h}`\n"
+        f"⬜ Undetected: `{u}`"
+        f"{top_detections(attrs.get('last_analysis_results',{}))}"
     )
 
 
-def format_ip_report(attrs: dict, ip: str) -> str:
-    stats       = attrs.get("last_analysis_stats", {})
-    malicious   = stats.get("malicious", 0)
-    suspicious  = stats.get("suspicious", 0)
-    harmless    = stats.get("harmless", 0)
-    undetected  = stats.get("undetected", 0)
-    total       = malicious + suspicious + harmless + undetected
-
-    country     = attrs.get("country", "N/A")
-    asn         = attrs.get("asn", "N/A")
-    as_owner    = attrs.get("as_owner", "N/A")[:40]
-    network     = attrs.get("network", "N/A")
-    rep_score   = attrs.get("reputation", "N/A")
-    continent   = attrs.get("continent", "N/A")
-
-    results     = attrs.get("last_analysis_results", {})
-    detections  = [
-        f"  • `{engine}`: {info.get('result','malicious')}"
-        for engine, info in results.items()
-        if info.get("category") in ("malicious", "suspicious")
-    ][:6]
-
-    detection_block = ""
-    if detections:
-        detection_block = "\n\n🔬 *Flagged By:*\n" + "\n".join(detections)
-
-    verdict = verdict_text(malicious, suspicious)
-    bar     = format_stats_bar(stats)
-    emoji   = threat_emoji(malicious, total)
-
+def fmt_ip(attrs: dict, ip: str) -> str:
+    s = attrs.get("last_analysis_stats", {})
+    m, sus, h, u = s.get("malicious", 0), s.get("suspicious", 0), s.get("harmless", 0), s.get("undetected", 0)
+    total = m + sus + h + u
     return (
-        f"{emoji} *VirusTotal IP Report*\n"
-        f"{'─' * 30}\n"
-        f"📡 *IP Address:* `{ip}`\n"
-        f"🌍 *Country:* `{country}` ({continent})\n"
-        f"🏢 *ASN:* `AS{asn}` — `{as_owner}`\n"
-        f"🕸 *Network:* `{network}`\n"
-        f"⭐ *Reputation:* `{rep_score}`\n\n"
-        f"🏁 *Verdict:* {verdict}\n"
-        f"📊 *Detection:* `{malicious}/{total}` engines\n"
-        f"{bar}\n\n"
-        f"🟥 Malicious:  `{malicious}`\n"
-        f"🟧 Suspicious: `{suspicious}`\n"
-        f"🟩 Harmless:   `{harmless}`\n"
-        f"⬜ Undetected: `{undetected}`"
-        f"{detection_block}"
+        f"{threat_emoji(m, total)} *VirusTotal IP Report*\n"
+        f"{'─'*30}\n"
+        f"📡 *IP:* `{ip}`\n"
+        f"🌍 *Country:* `{attrs.get('country','N/A')}` ({attrs.get('continent','N/A')})\n"
+        f"🏢 *ASN:* `AS{attrs.get('asn','N/A')}` — `{str(attrs.get('as_owner','N/A'))[:40]}`\n"
+        f"🕸 *Network:* `{attrs.get('network','N/A')}`\n"
+        f"⭐ *Reputation:* `{attrs.get('reputation','N/A')}`\n\n"
+        f"🏁 *Verdict:* {verdict_text(m, sus)}\n"
+        f"📊 *Detection:* `{m}/{total}` engines\n"
+        f"{stats_bar(s)}\n\n"
+        f"🟥 Malicious:  `{m}`\n"
+        f"🟧 Suspicious: `{sus}`\n"
+        f"🟩 Harmless:   `{h}`\n"
+        f"⬜ Undetected: `{u}`"
+        f"{top_detections(attrs.get('last_analysis_results',{}))}"
     )
-
-
-def format_hash_report(attrs: dict, hash_val: str) -> str:
-    return format_file_report(attrs, filename=hash_val[:16] + "...")
 
 
 # ─────────────────────────────────────────────
 #  Keyboards
 # ─────────────────────────────────────────────
-def vt_link_keyboard(link: str, label: str = "🔗 View Full Report on VT") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(label, url=link)]])
+def vt_btn(link: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Full Report on VirusTotal", url=link)]])
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
+def menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📁 Scan File",   callback_data="help_file"),
-            InlineKeyboardButton("🔗 Scan URL",    callback_data="help_url"),
-        ],
-        [
-            InlineKeyboardButton("🔐 Check Hash",  callback_data="help_hash"),
-            InlineKeyboardButton("🌐 Check Domain",callback_data="help_domain"),
-        ],
-        [
-            InlineKeyboardButton("📡 Check IP",    callback_data="help_ip"),
-            InlineKeyboardButton("ℹ️ About",        callback_data="about"),
-        ],
+        [InlineKeyboardButton("📁 File", callback_data="h_file"),
+         InlineKeyboardButton("🔗 URL",  callback_data="h_url")],
+        [InlineKeyboardButton("🔐 Hash", callback_data="h_hash"),
+         InlineKeyboardButton("🌐 Domain", callback_data="h_domain")],
+        [InlineKeyboardButton("📡 IP",   callback_data="h_ip"),
+         InlineKeyboardButton("ℹ️ About", callback_data="h_about")],
     ])
 
 
 # ─────────────────────────────────────────────
-#  /start Handler
+#  Stat tracker
 # ─────────────────────────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    text = (
-        f"🛡️ *VirusTotal Scanner Bot*\n"
-        f"{'━' * 32}\n\n"
-        f"Hey {user.mention_markdown_v2()}\\!\n\n"
-        f"I scan *files, URLs, hashes, domains & IPs* against\n"
-        f"**70\\+ antivirus engines** powered by VirusTotal API v3\\.\n\n"
-        f"📌 *What I can do:*\n"
-        f"  📁 Upload any file \\(APK, EXE, PDF, ZIP\\.\\.\\.\\)\n"
-        f"  🔗 Paste a URL or link\n"
-        f"  🔐 Send an MD5/SHA1/SHA256 hash\n"
-        f"  🌐 Enter a domain name\n"
-        f"  📡 Enter an IP address\n\n"
-        f"Just send it — no commands needed\\!\n"
-        f"Or tap a button below to learn more\\."
-    )
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=main_menu_keyboard(),
-    )
-
-
-# ─────────────────────────────────────────────
-#  /help Handler
-# ─────────────────────────────────────────────
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "🛡️ *VirusTotal Bot — Help*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📁 *Scan a File*\n"
-        "  Just send any file\\. Max 32MB for free tier\\.\n\n"
-        "🔗 *Scan a URL*\n"
-        "  Send: `https://example.com` or just `example.com`\n\n"
-        "🔐 *Check a Hash*\n"
-        "  Send MD5, SHA1, or SHA256 hash directly\\.\n\n"
-        "🌐 *Check a Domain*\n"
-        "  Send: `google.com` or `suspicious.xyz`\n\n"
-        "📡 *Check an IP*\n"
-        "  Send: `1.1.1.1` or any IPv4 address\n\n"
-        "⚡ *Commands:*\n"
-        "  /start — Welcome screen\n"
-        "  /help — This menu\n"
-        "  /stats — Your scan stats\n"
-        "  /about — About this bot\n\n"
-        "⚠️ *Note:* Free VT API = 4 req/min & 500 req/day\\."
-    )
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=main_menu_keyboard(),
-    )
-
-
-# ─────────────────────────────────────────────
-#  /about Handler
-# ─────────────────────────────────────────────
-async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "ℹ️ *About VirusTotal Bot*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🔧 *Stack:*\n"
-        "  • python\\-telegram\\-bot `v22.7`\n"
-        "  • VirusTotal API `v3`\n"
-        "  • Python `3.11+`\n"
-        "  • aiohttp \\(fully async\\)\n\n"
-        "🚀 *Hosted on:* Render\\.com \\(free tier\\)\n\n"
-        "📊 *Coverage:* 70\\+ AV engines\n"
-        "🔒 *Privacy:* Files are shared with VT partners\\.\n"
-        "  Use hashes for private lookups\\.\n\n"
-        "🛡 Powered by [VirusTotal](https://virustotal.com)"
-    )
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
-
-
-# ─────────────────────────────────────────────
-#  /stats Handler
-# ─────────────────────────────────────────────
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    data = context.user_data
-    total    = data.get("scans_total", 0)
-    files    = data.get("scans_files", 0)
-    urls     = data.get("scans_urls", 0)
-    hashes   = data.get("scans_hashes", 0)
-    domains  = data.get("scans_domains", 0)
-    ips      = data.get("scans_ips", 0)
-    threats  = data.get("threats_found", 0)
-
-    text = (
-        f"📊 *Your Scan Statistics*\n"
-        f"{'━' * 28}\n\n"
-        f"🔢 *Total Scans:* `{total}`\n\n"
-        f"📁 Files:    `{files}`\n"
-        f"🔗 URLs:     `{urls}`\n"
-        f"🔐 Hashes:   `{hashes}`\n"
-        f"🌐 Domains:  `{domains}`\n"
-        f"📡 IPs:      `{ips}`\n\n"
-        f"🚨 *Threats Found:* `{threats}`\n"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-
-# ─────────────────────────────────────────────
-#  Callback Query Handler (inline buttons)
-# ─────────────────────────────────────────────
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    help_texts = {
-        "help_file": (
-            "📁 *How to Scan a File*\n\n"
-            "Just send or forward any file to this chat\\.\n"
-            "Supported: APK, EXE, PDF, ZIP, DOCX, JS, PY\\.\\.\\.\n"
-            "Max size: `32 MB` \\(free API limit\\)\n\n"
-            "I'll upload it to VirusTotal and return a full report\\."
-        ),
-        "help_url": (
-            "🔗 *How to Scan a URL*\n\n"
-            "Send a URL like:\n"
-            "`https://suspicious\\-site\\.com`\n"
-            "`http://malware\\.example\\.org/payload`\n\n"
-            "Or even bare domains like `phishing\\.xyz`"
-        ),
-        "help_hash": (
-            "🔐 *How to Check a Hash*\n\n"
-            "Send a file hash directly:\n"
-            "`d41d8cd98f00b204e9800998ecf8427e` \\(MD5\\)\n"
-            "`da39a3ee5e6b4b0d3255bfef95601890afd80709` \\(SHA1\\)\n"
-            "`e3b0c44298fc1c149afb...` \\(SHA256\\)\n\n"
-            "This is the most private way — no file upload needed\\!"
-        ),
-        "help_domain": (
-            "🌐 *How to Check a Domain*\n\n"
-            "Send a domain name:\n"
-            "`malicious\\.domain\\.com`\n"
-            "`suspicious\\.xyz`\n\n"
-            "Returns registrar info, reputation, and AV verdicts\\."
-        ),
-        "help_ip": (
-            "📡 *How to Check an IP*\n\n"
-            "Send an IPv4 address:\n"
-            "`192\\.168\\.1\\.1`\n"
-            "`8\\.8\\.8\\.8`\n\n"
-            "Returns ASN, country, reputation, and AV verdicts\\."
-        ),
-        "about": (
-            "ℹ️ *VirusTotal Bot*\n\n"
-            "Built with `python\\-telegram\\-bot 22\\.7` \\+ VT API v3\\.\n"
-            "Async • Production\\-grade • Hosted on Render\\."
-        ),
-    }
-
-    msg = help_texts.get(query.data, "Unknown action")
-    await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
-
-
-# ─────────────────────────────────────────────
-#  Scan stat tracker
-# ─────────────────────────────────────────────
-def track_scan(context: ContextTypes.DEFAULT_TYPE, scan_type: str, threat: bool = False):
-    d = context.user_data
-    d["scans_total"]    = d.get("scans_total", 0) + 1
-    d[f"scans_{scan_type}"] = d.get(f"scans_{scan_type}", 0) + 1
+def track(ctx: ContextTypes.DEFAULT_TYPE, scan_type: str, threat: bool = False):
+    d = ctx.user_data
+    d["total"]   = d.get("total", 0) + 1
+    d[scan_type] = d.get(scan_type, 0) + 1
     if threat:
-        d["threats_found"] = d.get("threats_found", 0) + 1
+        d["threats"] = d.get("threats", 0) + 1
+
+
+# ─────────────────────────────────────────────
+#  Handlers
+# ─────────────────────────────────────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    await update.message.reply_text(
+        f"🛡️ *VirusTotal Scanner Bot*\n"
+        f"{'━'*30}\n\n"
+        f"Hey {u.first_name}! I scan everything against *70+ AV engines*.\n\n"
+        f"*Just send me:*\n"
+        f"  📁 Any file (APK, EXE, PDF, ZIP...)\n"
+        f"  🔗 A URL or link\n"
+        f"  🔐 An MD5 / SHA1 / SHA256 hash\n"
+        f"  🌐 A domain name\n"
+        f"  📡 An IP address\n\n"
+        f"No commands needed — just send it!",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=menu_kb(),
+    )
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🛡️ *VirusTotal Bot — Help*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📁 *File* — Send any attachment (max 32MB)\n"
+        "🔗 *URL* — `https://example.com`\n"
+        "🔐 *Hash* — MD5 / SHA1 / SHA256 directly\n"
+        "🌐 *Domain* — `google.com`, `evil.xyz`\n"
+        "📡 *IP* — `1.1.1.1`\n\n"
+        "⚡ *Commands:*\n"
+        "  /start /help /stats /about\n\n"
+        "⚠️ Free VT API: 4 req/min, 500 req/day",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=menu_kb(),
+    )
+
+
+async def cmd_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "ℹ️ *VirusTotal Bot v2.0*\n\n"
+        "• `python-telegram-bot` v22.7\n"
+        "• VirusTotal API v3\n"
+        "• Fully async (aiohttp)\n"
+        "• Webhook mode + keep-alive\n"
+        "• Hosted on Render.com (free)\n\n"
+        "Powered by [VirusTotal](https://virustotal.com)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    d = ctx.user_data
+    await update.message.reply_text(
+        f"📊 *Your Scan Stats*\n"
+        f"{'━'*24}\n\n"
+        f"🔢 Total:    `{d.get('total',0)}`\n"
+        f"📁 Files:    `{d.get('files',0)}`\n"
+        f"🔗 URLs:     `{d.get('urls',0)}`\n"
+        f"🔐 Hashes:   `{d.get('hashes',0)}`\n"
+        f"🌐 Domains:  `{d.get('domains',0)}`\n"
+        f"📡 IPs:      `{d.get('ips',0)}`\n\n"
+        f"🚨 Threats:  `{d.get('threats',0)}`",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    tips = {
+        "h_file":  "📁 *File Scan*\n\nJust send any file attachment.\nSupported: APK, EXE, PDF, ZIP, JS, PY, etc.\nMax: `32 MB`",
+        "h_url":   "🔗 *URL Scan*\n\nSend:\n`https://suspicious.com`\n`http://malware.xyz/payload`",
+        "h_hash":  "🔐 *Hash Lookup*\n\nSend an MD5, SHA1, or SHA256 hash.\nPrivate — no file upload needed!",
+        "h_domain":"🌐 *Domain Check*\n\nSend:\n`malicious.domain.com`\n`phishing.xyz`",
+        "h_ip":    "📡 *IP Check*\n\nSend:\n`192.168.1.1`\n`8.8.8.8`",
+        "h_about": "ℹ️ *VirusTotal Bot v2.0*\n\npython-telegram-bot `22.7` + VT API v3\nWebhook + async + Render free tier",
+    }
+    await q.message.reply_text(tips.get(q.data, "?"), parse_mode=ParseMode.MARKDOWN)
 
 
 # ─────────────────────────────────────────────
 #  File Handler
 # ─────────────────────────────────────────────
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.message
-    doc = message.document or message.audio or message.video or message.photo
-
-    # Resolve correct file object
-    if message.photo:
-        doc = message.photo[-1]
+async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    doc = msg.document or msg.audio or msg.video
+    if msg.photo:
+        doc      = msg.photo[-1]
         filename = "photo.jpg"
     else:
-        filename = getattr(doc, "file_name", None) or "unknown_file"
+        filename = getattr(doc, "file_name", None) or "file"
 
     file_size = getattr(doc, "file_size", 0) or 0
-    max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
-
-    if file_size > max_bytes:
-        await message.reply_text(
-            f"❌ File too large\\! Max `{MAX_FILE_SIZE_MB}MB` for free VT API\\.\n"
-            f"Your file: `{bytes_to_human(file_size)}`\n\n"
-            f"💡 Tip: Send the file's SHA256 hash instead for a lookup\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
+    if file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        await msg.reply_text(
+            f"❌ File too large! Max `{MAX_FILE_SIZE_MB}MB`.\n"
+            f"Your file: `{human_bytes(file_size)}`\n\n"
+            f"💡 Send the SHA256 hash instead for a private lookup.",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-    status_msg = await message.reply_text(
-        "⏳ *Downloading file\\.\\.\\.*", parse_mode=ParseMode.MARKDOWN_V2
-    )
+    await msg.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+    status = await msg.reply_text("⏳ *Downloading file...*", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        tg_file = await context.bot.get_file(doc.file_id)
+        tg_file = await ctx.bot.get_file(doc.file_id)
         buf = io.BytesIO()
         await tg_file.download_to_memory(buf)
         file_bytes = buf.getvalue()
-
-        # Compute hash for VT GUI link
         sha256 = hashlib.sha256(file_bytes).hexdigest()
-        vt_link = f"{VT_GUI_BASE}/file/{sha256}"
 
-        await status_msg.edit_text(
-            "🔬 *Uploading to VirusTotal\\.\\.\\.*", parse_mode=ParseMode.MARKDOWN_V2
-        )
+        await status.edit_text("🔬 *Uploading to VirusTotal...*", parse_mode=ParseMode.MARKDOWN)
 
         async with aiohttp.ClientSession() as session:
-            resp, status = await vt_post_file(session, file_bytes, filename)
-
-            if status not in (200, 201):
+            resp, code = await vt_upload_file(session, file_bytes, filename)
+            if code not in (200, 201):
                 err = resp.get("error", {}).get("message", "Unknown error")
-                await status_msg.edit_text(
-                    f"❌ *VT Upload Failed:* `{err}`", parse_mode=ParseMode.MARKDOWN_V2
-                )
+                await status.edit_text(f"❌ *VT Upload Failed:* `{err}`", parse_mode=ParseMode.MARKDOWN)
                 return
 
             analysis_id = resp["data"]["id"]
-
-            await status_msg.edit_text(
-                "⚙️ *Scanning with 70\\+ AV engines\\.\\.\\.*\n"
-                "_This may take up to 2 minutes\\._",
-                parse_mode=ParseMode.MARKDOWN_V2,
+            await status.edit_text(
+                "⚙️ *Scanning with 70+ AV engines...*\n_Up to 2 minutes..._",
+                parse_mode=ParseMode.MARKDOWN,
             )
+            await vt_poll(session, analysis_id)
 
-            result = await vt_poll_analysis(session, analysis_id)
+            full, s2 = await vt_get(session, f"/files/{sha256}")
+            if s2 != 200:
+                await status.edit_text("⏰ *Scan timed out.* Try again.", parse_mode=ParseMode.MARKDOWN)
+                return
+            attrs = full["data"]["attributes"]
 
-            if not result:
-                # Try fetching by hash directly
-                result, s2 = await vt_get(session, f"/files/{sha256}")
-                if s2 != 200:
-                    await status_msg.edit_text(
-                        "⏰ *Scan timed out\\.* Try again in a minute\\.",
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                    )
-                    return
-                attrs = result["data"]["attributes"]
-            else:
-                # Get full file report by hash
-                full, _ = await vt_get(session, f"/files/{sha256}")
-                attrs = full.get("data", {}).get("attributes", result["data"]["attributes"])
-
-        report  = format_file_report(attrs, filename)
-        stats   = attrs.get("last_analysis_stats", {})
-        threat  = stats.get("malicious", 0) > 0 or stats.get("suspicious", 0) > 0
-
-        track_scan(context, "files", threat)
-
-        await status_msg.edit_text(
-            report,
+        st = attrs.get("last_analysis_stats", {})
+        track(ctx, "files", st.get("malicious", 0) > 0)
+        await status.edit_text(
+            fmt_file(attrs, filename),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=vt_link_keyboard(vt_link),
+            reply_markup=vt_btn(f"{VT_GUI}/file/{sha256}"),
         )
 
     except Exception as e:
-        logger.error(f"File scan error: {e}", exc_info=True)
-        await status_msg.edit_text(
-            f"❌ *Error:* `{str(e)[:200]}`", parse_mode=ParseMode.MARKDOWN_V2
-        )
+        logger.error(f"File error: {e}", exc_info=True)
+        await status.edit_text(f"❌ *Error:* `{str(e)[:200]}`", parse_mode=ParseMode.MARKDOWN)
 
 
 # ─────────────────────────────────────────────
-#  Text Handler — detects URL / Hash / IP / Domain
+#  Text Handler
 # ─────────────────────────────────────────────
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    # ── Hash ──
     if HASH_MD5.match(text) or HASH_SHA1.match(text) or HASH_SHA256.match(text):
-        await scan_hash(update, context, text)
-        return
-
-    # ── IP ──
-    if IP_PATTERN.match(text):
-        await scan_ip(update, context, text)
-        return
-
-    # ── URL (with scheme) ──
-    if text.startswith(("http://", "https://")):
-        await scan_url(update, context, text)
-        return
-
-    # ── Domain ──
-    if DOMAIN_PATTERN.match(text) and "." in text:
-        # Heuristic: if it looks like a URL without scheme
-        if "/" in text or text.count(".") >= 1:
-            # Could be domain or URL — check for path
-            if re.match(r"^[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}$", text):
-                await scan_domain(update, context, text)
-            else:
-                await scan_url(update, context, "https://" + text)
-            return
-
-    # ── Fallback ──
-    await update.message.reply_text(
-        "🤔 *I couldn't identify what to scan\\!*\n\n"
-        "Send me:\n"
-        "• A *file* attachment\n"
-        "• A *URL*: `https://example.com`\n"
-        "• A *hash*: MD5 / SHA1 / SHA256\n"
-        "• A *domain*: `google.com`\n"
-        "• An *IP*: `1.1.1.1`\n\n"
-        "Use /help for details\\.",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
+        await do_hash(update, ctx, text)
+    elif IP_PATTERN.match(text):
+        await do_ip(update, ctx, text)
+    elif text.startswith(("http://", "https://")):
+        await do_url(update, ctx, text)
+    elif DOMAIN_RE.match(text) and "." in text:
+        if "/" in text:
+            await do_url(update, ctx, "https://" + text)
+        else:
+            await do_domain(update, ctx, text)
+    else:
+        await update.message.reply_text(
+            "🤔 *Not sure what to scan!*\n\n"
+            "Send me a *file*, *URL*, *hash*, *domain*, or *IP*.\n"
+            "Use /help for details.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 
-# ─────────────────────────────────────────────
-#  Scan: URL
-# ─────────────────────────────────────────────
-async def scan_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
-    status_msg = await update.message.reply_text(
-        "🔗 *Scanning URL\\.\\.\\.*", parse_mode=ParseMode.MARKDOWN_V2
-    )
+async def do_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
+    status = await update.message.reply_text("🔗 *Scanning URL...*", parse_mode=ParseMode.MARKDOWN)
     try:
         async with aiohttp.ClientSession() as session:
-            # Submit URL
-            resp, status = await vt_post_json(session, "/urls", {"url": url})
-            if status not in (200, 201):
-                err = resp.get("error", {}).get("message", "Unknown error")
-                await status_msg.edit_text(
-                    f"❌ *Error:* `{err}`", parse_mode=ParseMode.MARKDOWN_V2
-                )
+            resp, code = await vt_post(session, "/urls", {"url": url})
+            if code not in (200, 201):
+                err = resp.get("error", {}).get("message", "Unknown")
+                await status.edit_text(f"❌ `{err}`", parse_mode=ParseMode.MARKDOWN)
                 return
-
             analysis_id = resp["data"]["id"]
-            await status_msg.edit_text(
-                "⚙️ *Analyzing URL\\.\\.\\.*", parse_mode=ParseMode.MARKDOWN_V2
-            )
-
-            result = await vt_poll_analysis(session, analysis_id)
-
-            # Get full URL report using URL ID
+            await status.edit_text("⚙️ *Analyzing URL...*", parse_mode=ParseMode.MARKDOWN)
+            await vt_poll(session, analysis_id)
             url_id = urlsafe_b64encode(url.encode()).decode().rstrip("=")
             full, s2 = await vt_get(session, f"/urls/{url_id}")
-
-            if s2 == 200:
-                attrs = full["data"]["attributes"]
-            elif result:
-                attrs = result["data"]["attributes"]
-            else:
-                await status_msg.edit_text(
-                    "⏰ *Scan timed out\\.* Try again\\.", parse_mode=ParseMode.MARKDOWN_V2
-                )
+            if s2 != 200:
+                await status.edit_text("⏰ Timed out. Try again.", parse_mode=ParseMode.MARKDOWN)
                 return
+            attrs = full["data"]["attributes"]
 
-        report  = format_url_report(attrs, url)
-        stats   = attrs.get("last_analysis_stats", {})
-        threat  = stats.get("malicious", 0) > 0
-
-        track_scan(context, "urls", threat)
-        vt_link = f"{VT_GUI_BASE}/url/{url_id}"
-
-        await status_msg.edit_text(
-            report,
+        st = attrs.get("last_analysis_stats", {})
+        track(ctx, "urls", st.get("malicious", 0) > 0)
+        url_id = urlsafe_b64encode(url.encode()).decode().rstrip("=")
+        await status.edit_text(
+            fmt_url(attrs, url),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=vt_link_keyboard(vt_link),
+            reply_markup=vt_btn(f"{VT_GUI}/url/{url_id}"),
         )
-
     except Exception as e:
-        logger.error(f"URL scan error: {e}", exc_info=True)
-        await status_msg.edit_text(
-            f"❌ *Error:* `{str(e)[:200]}`", parse_mode=ParseMode.MARKDOWN_V2
-        )
+        logger.error(f"URL error: {e}", exc_info=True)
+        await status.edit_text(f"❌ `{str(e)[:200]}`", parse_mode=ParseMode.MARKDOWN)
 
 
-# ─────────────────────────────────────────────
-#  Scan: Hash
-# ─────────────────────────────────────────────
-async def scan_hash(update: Update, context: ContextTypes.DEFAULT_TYPE, hash_val: str) -> None:
-    hash_type = (
-        "MD5"    if len(hash_val) == 32 else
-        "SHA1"   if len(hash_val) == 40 else
-        "SHA256"
-    )
-    status_msg = await update.message.reply_text(
-        f"🔐 *Looking up {hash_type} hash\\.\\.\\.*",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
+async def do_hash(update: Update, ctx: ContextTypes.DEFAULT_TYPE, h: str):
+    htype = "MD5" if len(h) == 32 else "SHA1" if len(h) == 40 else "SHA256"
+    status = await update.message.reply_text(f"🔐 *Looking up {htype}...*", parse_mode=ParseMode.MARKDOWN)
     try:
         async with aiohttp.ClientSession() as session:
-            data, status = await vt_get(session, f"/files/{hash_val}")
-
-        if status == 404:
-            await status_msg.edit_text(
-                f"🔍 *Hash not in VirusTotal database\\.* \n\n"
-                f"This file has never been scanned before\\.\n"
-                f"Upload the actual file for a fresh scan\\.",
-                parse_mode=ParseMode.MARKDOWN_V2,
+            data, code = await vt_get(session, f"/files/{h}")
+        if code == 404:
+            await status.edit_text(
+                "🔍 *Hash not found in VT database.*\nNever been scanned. Upload the actual file.",
+                parse_mode=ParseMode.MARKDOWN,
             )
             return
-
-        if status != 200:
-            err = data.get("error", {}).get("message", "Unknown error")
-            await status_msg.edit_text(
-                f"❌ *Error:* `{err}`", parse_mode=ParseMode.MARKDOWN_V2
-            )
+        if code != 200:
+            await status.edit_text(f"❌ `{data.get('error',{}).get('message','Error')}`", parse_mode=ParseMode.MARKDOWN)
             return
-
-        attrs   = data["data"]["attributes"]
-        report  = format_hash_report(attrs, hash_val)
-        stats   = attrs.get("last_analysis_stats", {})
-        threat  = stats.get("malicious", 0) > 0
-
-        track_scan(context, "hashes", threat)
-        vt_link = f"{VT_GUI_BASE}/file/{hash_val}"
-
-        await status_msg.edit_text(
-            report,
+        attrs = data["data"]["attributes"]
+        st = attrs.get("last_analysis_stats", {})
+        track(ctx, "hashes", st.get("malicious", 0) > 0)
+        await status.edit_text(
+            fmt_file(attrs, h[:16] + "..."),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=vt_link_keyboard(vt_link),
+            reply_markup=vt_btn(f"{VT_GUI}/file/{h}"),
         )
-
     except Exception as e:
-        logger.error(f"Hash scan error: {e}", exc_info=True)
-        await status_msg.edit_text(
-            f"❌ *Error:* `{str(e)[:200]}`", parse_mode=ParseMode.MARKDOWN_V2
-        )
+        await status.edit_text(f"❌ `{str(e)[:200]}`", parse_mode=ParseMode.MARKDOWN)
 
 
-# ─────────────────────────────────────────────
-#  Scan: Domain
-# ─────────────────────────────────────────────
-async def scan_domain(update: Update, context: ContextTypes.DEFAULT_TYPE, domain: str) -> None:
-    status_msg = await update.message.reply_text(
-        "🌐 *Checking domain\\.\\.\\.*", parse_mode=ParseMode.MARKDOWN_V2
-    )
+async def do_domain(update: Update, ctx: ContextTypes.DEFAULT_TYPE, domain: str):
+    status = await update.message.reply_text("🌐 *Checking domain...*", parse_mode=ParseMode.MARKDOWN)
     try:
         async with aiohttp.ClientSession() as session:
-            data, status = await vt_get(session, f"/domains/{domain}")
-
-        if status == 404:
-            await status_msg.edit_text(
-                "🔍 *Domain not found in VT database\\.* Try a URL scan instead\\.",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
+            data, code = await vt_get(session, f"/domains/{domain}")
+        if code == 404:
+            await status.edit_text("🔍 Domain not in VT database.", parse_mode=ParseMode.MARKDOWN)
             return
-
-        if status != 200:
-            err = data.get("error", {}).get("message", "Unknown error")
-            await status_msg.edit_text(
-                f"❌ *Error:* `{err}`", parse_mode=ParseMode.MARKDOWN_V2
-            )
+        if code != 200:
+            await status.edit_text(f"❌ `{data.get('error',{}).get('message','Error')}`", parse_mode=ParseMode.MARKDOWN)
             return
-
-        attrs   = data["data"]["attributes"]
-        report  = format_domain_report(attrs, domain)
-        stats   = attrs.get("last_analysis_stats", {})
-        threat  = stats.get("malicious", 0) > 0
-
-        track_scan(context, "domains", threat)
-        vt_link = f"{VT_GUI_BASE}/domain/{domain}"
-
-        await status_msg.edit_text(
-            report,
+        attrs = data["data"]["attributes"]
+        st = attrs.get("last_analysis_stats", {})
+        track(ctx, "domains", st.get("malicious", 0) > 0)
+        await status.edit_text(
+            fmt_domain(attrs, domain),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=vt_link_keyboard(vt_link),
+            reply_markup=vt_btn(f"{VT_GUI}/domain/{domain}"),
         )
-
     except Exception as e:
-        logger.error(f"Domain scan error: {e}", exc_info=True)
-        await status_msg.edit_text(
-            f"❌ *Error:* `{str(e)[:200]}`", parse_mode=ParseMode.MARKDOWN_V2
-        )
+        await status.edit_text(f"❌ `{str(e)[:200]}`", parse_mode=ParseMode.MARKDOWN)
 
 
-# ─────────────────────────────────────────────
-#  Scan: IP Address
-# ─────────────────────────────────────────────
-async def scan_ip(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str) -> None:
-    status_msg = await update.message.reply_text(
-        "📡 *Checking IP address\\.\\.\\.*", parse_mode=ParseMode.MARKDOWN_V2
-    )
+async def do_ip(update: Update, ctx: ContextTypes.DEFAULT_TYPE, ip: str):
+    status = await update.message.reply_text("📡 *Checking IP...*", parse_mode=ParseMode.MARKDOWN)
     try:
         async with aiohttp.ClientSession() as session:
-            data, status = await vt_get(session, f"/ip_addresses/{ip}")
-
-        if status != 200:
-            err = data.get("error", {}).get("message", "Unknown error")
-            await status_msg.edit_text(
-                f"❌ *Error:* `{err}`", parse_mode=ParseMode.MARKDOWN_V2
-            )
+            data, code = await vt_get(session, f"/ip_addresses/{ip}")
+        if code != 200:
+            await status.edit_text(f"❌ `{data.get('error',{}).get('message','Error')}`", parse_mode=ParseMode.MARKDOWN)
             return
-
-        attrs   = data["data"]["attributes"]
-        report  = format_ip_report(attrs, ip)
-        stats   = attrs.get("last_analysis_stats", {})
-        threat  = stats.get("malicious", 0) > 0
-
-        track_scan(context, "ips", threat)
-        vt_link = f"{VT_GUI_BASE}/ip-address/{ip}"
-
-        await status_msg.edit_text(
-            report,
+        attrs = data["data"]["attributes"]
+        st = attrs.get("last_analysis_stats", {})
+        track(ctx, "ips", st.get("malicious", 0) > 0)
+        await status.edit_text(
+            fmt_ip(attrs, ip),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=vt_link_keyboard(vt_link),
+            reply_markup=vt_btn(f"{VT_GUI}/ip-address/{ip}"),
         )
-
     except Exception as e:
-        logger.error(f"IP scan error: {e}", exc_info=True)
-        await status_msg.edit_text(
-            f"❌ *Error:* `{str(e)[:200]}`", parse_mode=ParseMode.MARKDOWN_V2
-        )
+        await status.edit_text(f"❌ `{str(e)[:200]}`", parse_mode=ParseMode.MARKDOWN)
 
 
 # ─────────────────────────────────────────────
 #  Error Handler
 # ─────────────────────────────────────────────
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Exception while handling update:", exc_info=context.error)
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    logger.error("Update error:", exc_info=ctx.error)
     if isinstance(update, Update) and update.message:
-        await update.message.reply_text(
-            "⚠️ Something went wrong\\. Please try again later\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("⚠️ Something went wrong. Please try again.")
 
 
 # ─────────────────────────────────────────────
-#  Minimal HTTP server for Render health checks
+#  Self-Ping Keep-Alive (prevents Render sleep)
 # ─────────────────────────────────────────────
-async def health_handler(request: web.Request) -> web.Response:
-    return web.Response(text="🛡️ VT Bot is alive!", content_type="text/plain")
+async def self_ping_loop():
+    """Pings own health endpoint every 13 minutes to prevent Render free tier sleep."""
+    if not RENDER_URL:
+        logger.info("No RENDER_URL set — skipping self-ping.")
+        return
+    await asyncio.sleep(60)  # initial delay
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(f"{RENDER_URL}/health", timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    logger.info(f"Self-ping: {r.status}")
+            except Exception as e:
+                logger.warning(f"Self-ping failed: {e}")
+            await asyncio.sleep(13 * 60)  # 13 minutes
 
 
-async def run_web_server() -> None:
+# ─────────────────────────────────────────────
+#  aiohttp Web App (health + webhook)
+# ─────────────────────────────────────────────
+async def build_app(ptb_app: Application) -> web.Application:
+    async def health(request):
+        return web.Response(text="🛡️ VT Bot is alive!", content_type="text/plain")
+
+    async def webhook(request):
+        try:
+            data = await request.json()
+            update = Update.de_json(data, ptb_app.bot)
+            await ptb_app.process_update(update)
+        except Exception as e:
+            logger.error(f"Webhook error: {e}", exc_info=True)
+        return web.Response(text="OK")
+
     app = web.Application()
-    app.router.add_get("/", health_handler)
-    app.router.add_get("/health", health_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"Health server running on port {PORT}")
+    app.router.add_get("/",         health)
+    app.router.add_get("/health",   health)
+    app.router.add_post(WEBHOOK_PATH, webhook)
+    return app
 
 
 # ─────────────────────────────────────────────
 #  Main
 # ─────────────────────────────────────────────
-async def main() -> None:
-    logger.info("🛡️  Starting VirusTotal Telegram Bot...")
+async def main():
+    logger.info("🛡️  VirusTotal Bot starting up...")
 
-    # Start health check server
-    await run_web_server()
-
-    # Build Telegram application
-    app = (
+    # Build PTB app
+    ptb_app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
         .build()
     )
 
-    # ── Register handlers ──
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help",  cmd_help))
-    app.add_handler(CommandHandler("about", cmd_about))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CallbackQueryHandler(callback_handler))
+    # Register handlers
+    ptb_app.add_handler(CommandHandler("start", cmd_start))
+    ptb_app.add_handler(CommandHandler("help",  cmd_help))
+    ptb_app.add_handler(CommandHandler("about", cmd_about))
+    ptb_app.add_handler(CommandHandler("stats", cmd_stats))
+    ptb_app.add_handler(CallbackQueryHandler(callback_handler))
+    ptb_app.add_handler(MessageHandler(filters.Document.ALL | filters.AUDIO | filters.VIDEO | filters.PHOTO, handle_file))
+    ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    ptb_app.add_error_handler(error_handler)
 
-    # File handlers
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-    app.add_handler(MessageHandler(filters.AUDIO,        handle_file))
-    app.add_handler(MessageHandler(filters.VIDEO,        handle_file))
-    app.add_handler(MessageHandler(filters.PHOTO,        handle_file))
+    await ptb_app.initialize()
+    await ptb_app.start()
 
-    # Text handler (URLs, hashes, IPs, domains)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # Set webhook
+    if RENDER_URL:
+        await ptb_app.bot.set_webhook(
+            url=WEBHOOK_URL,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+        logger.info(f"Webhook set: {WEBHOOK_URL}")
+    else:
+        logger.warning("RENDER_URL not set — webhook NOT registered with Telegram!")
 
-    # Error handler
-    app.add_error_handler(error_handler)
+    # Start web server
+    web_app  = await build_app(ptb_app)
+    runner   = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Web server on port {PORT}")
 
-    logger.info("🤖 Bot polling started. Press Ctrl+C to stop.")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    # Start keep-alive pinger
+    asyncio.create_task(self_ping_loop())
 
-    # Run forever
+    logger.info("✅ Bot is live!")
     try:
         await asyncio.Event().wait()
     finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+        await ptb_app.bot.delete_webhook()
+        await ptb_app.stop()
+        await ptb_app.shutdown()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
